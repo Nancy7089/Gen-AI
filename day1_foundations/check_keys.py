@@ -80,5 +80,5 @@ else:
                 f"❌ OPENWEATHER_API_KEY: "
                 f"HTTP {response.status_code} -> {message}"
             )
-    except Exception as e:9
+    except Exception as e:
         print(f"❌ OPENWEATHER_API_KEY: Failed -> {e}")

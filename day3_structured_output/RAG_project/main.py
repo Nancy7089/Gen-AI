@@ -9,7 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 # Load the text file
-file_path = Path(__file__).resolve().parent.parent / "document_loaders" / "notes.txt"
+file_path = Path(__file__).resolve().parent / "document_loaders" / "notes.txt"
 
 data = TextLoader(str(file_path))
 docs = data.load()

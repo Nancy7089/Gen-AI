@@ -11,5 +11,4 @@ data = PyPDFLoader(str(file_path))
 # Load all pages
 docs = data.load()
 
-# Print page 15 (index 14)
 print(docs[1])

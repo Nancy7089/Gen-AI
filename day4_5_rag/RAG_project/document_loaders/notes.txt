@@ -1,0 +1,399 @@
+# TomPatch — Product Requirements Document
+
+**Zero-Trust Decentralized Firmware Delivery for Heterogeneous IoT Fleets**
+
+| | |
+|---|---|
+| Document status | Draft v1.0 |
+| Date | 2026-08-12 |
+| Repo | `TomPatch/` (monorepo: `TomPatch-Web`, `TomPatch-Chain`, `TomPatch-CLI`) |
+| Audience | Product / engineering team, academic evaluators (EnTC), prospective pilot customers |
+
+---
+
+## 1. Executive Summary
+
+TomPatch is a secure Over-The-Air (OTA) firmware update platform that removes the single point of failure inherent in today's centralized update infrastructure. Instead of asking IoT devices to blindly trust a vendor's server and a single signing key, TomPatch anchors every firmware release to a public blockchain (Polygon) and stores the binaries on decentralized storage (IPFS). A device installs an update only if the SHA-256 hash of the file it downloaded matches the hash immutably recorded on-chain.
+
+The core innovation is the **Dual-Verify protocol**, a practical defense against supply-chain attacks of the SolarWinds class. A release is built twice — once by an automated CI pipeline (GitHub Actions) and once locally by an administrator using a deterministic build environment. The release can only go live if both builds produce the exact same hash, proving that neither the cloud build server nor the local machine injected code. Only then does the administrator sign the transaction that flips the release from `PENDING` to `LIVE` on the smart contract.
+
+**Positioning in one line:** "Stripe for firmware" — a drop-in secure delivery pipeline for hardware teams that cannot afford a dedicated DevSecOps organization, with security guarantees (vendor neutrality, immutable audit trail, no single point of trust) that centralized incumbents (Mender, AWS IoT, Foundries.io) structurally cannot offer.
+
+The MVP is scoped as an academic (EnTC) demonstration: a deployed smart contract on Polygon Amoy testnet, a Next.js management dashboard, and a Python edge-gateway agent that verifies updates and physically flashes downstream microcontrollers over serial (UART/SPI).
+
+---
+
+## 2. Problem Statement
+
+### 2.1 The Single Point of Failure (SPOF)
+
+Current OTA platforms (AWS IoT Core, Azure IoT Hub, Mender.io) follow a centralized client–server model secured by PKI: firmware is signed with the vendor's private key and served over TLS. This is adequate against network-level attackers, but it concentrates all trust in two assets:
+
+1. **The vendor's build/update server.** If compromised, malware is injected *before* signing, so the signature is legitimate.
+2. **The vendor's private signing key.** If stolen, the attacker can sign anything.
+
+### 2.2 Supply-chain attacks are the proven failure mode
+
+- **SolarWinds (2020):** attackers compromised the build server. The malware-laden update was signed with SolarWinds' legitimate key and accepted by ~18,000 organizations. The devices did exactly what they were designed to do — trust the vendor — and that trust was the vulnerability.
+- **ASUS ShadowHammer (2019):** the official ASUS Live Update server pushed backdoored, validly-signed updates to hundreds of thousands of machines.
+
+In both cases the failure was not cryptography; it was **centralized trust**. Signature checking proves *integrity relative to whoever signed*, not that the release was legitimate.
+
+### 2.3 Blind signing
+
+Even with human approval gates, an approver shown "Release v2.1 pending — approve?" has no practical way to inspect a compiled binary. If the build system is compromised, the human rubber-stamps malware. Approval workflows without independent verification are security theater.
+
+### 2.4 The end-of-life (bricking) problem
+
+IoT devices routinely outlive their manufacturers. When a vendor shuts down (bankruptcy, acquisition, product sunset), its update servers go dark and every fielded device is permanently frozen — unpatchable and increasingly insecure. Centralized platforms cannot solve this: the infrastructure *is* the company.
+
+### 2.5 Rollback (replay) attacks
+
+An attacker who cannot forge a new release can replay an *old, validly-signed* release that contains a known vulnerability, then exploit it. Any update protocol that only checks "is this hash/signature valid?" without enforcing version monotonicity is vulnerable.
+
+### 2.6 Fleet heterogeneity
+
+Real fleets mix Linux gateways, ESP32-class microcontrollers, and bare-metal ECUs, each with different installation mechanics (filesystem swap vs. A/B partition flash vs. external flasher). Teams end up maintaining fragmented, per-target update tooling.
+
+---
+
+## 3. Goals and Non-Goals
+
+### 3.1 Goals
+
+| # | Goal |
+|---|---|
+| G1 | Eliminate the single point of failure in firmware distribution using IPFS for storage and Polygon for the trust anchor. |
+| G2 | Guarantee firmware integrity end-to-end: a file altered by even one bit is detected and rejected by the device. |
+| G3 | Defeat compromised-build-server attacks via the Dual-Verify protocol (independent cloud and local reproducible builds must agree). |
+| G4 | Prevent rollback attacks through smart-contract-enforced monotonic versioning. |
+| G5 | Produce an immutable, publicly auditable release history (who proposed, who verified, who approved, when). |
+| G6 | Support constrained devices through a gateway architecture: heavy crypto runs on the edge gateway, which flashes downstream MCUs over serial. |
+| G7 | Keep per-release cost negligible (< $0.05 in gas) so security is not priced out. |
+| G8 | Align with NIST SP 800-193 (Platform Firmware Resiliency): authenticity/integrity protection and an immutable root of trust. |
+
+### 3.2 Non-Goals
+
+- **Universal installer.** TomPatch is the secure transport and verification layer, not an installer for every OS. We ship one reference agent (Python, Linux gateway) and one hardware flashing path (serial → MCU). Other targets integrate via the SDK's install hook.
+- **Consumer-commodity economics.** The design targets high-value / high-security fleets (industrial, energy, medical-adjacent, DePIN), not $5 smart plugs where any per-update cost is unacceptable.
+- **Building a compiler or CI system.** We integrate with GitHub Actions; we do not replace it.
+- **On-chain firmware storage.** Binaries never touch the chain; only metadata (version, CID, hash, status) does.
+- **Full light-client verification on MCUs.** Devices trust the gateway; the gateway trusts an RPC endpoint (mitigations and roadmap in §8.3).
+
+---
+
+## 4. Target Users and Personas
+
+### 4.1 Persona: "Sarah" — Lead firmware engineer at a hardware startup (primary)
+
+- Team of ~5 engineers building smart locks / air-quality monitors / pet feeders. Strong at hardware, weak at cloud security. Cannot justify a $150k/yr DevSecOps hire.
+- **Wants:** push an update with one CLI command, see fleet status on a dashboard, never think about key ceremonies or servers.
+- **Buys because:** TomPatch is "security DevOps in a box" — three lines of SDK code on-device, one `tompatch push` command in CI.
+
+### 4.2 Persona: Industrial retro-fitter
+
+- Puts sensors on remote assets (solar farms, factory machines). A bricked device means a 500-mile truck roll.
+- **Buys because:** hash verification before install is anti-brick insurance; IPFS availability means updates keep flowing even if a vendor portal is down.
+
+### 4.3 Persona: Compliance-heavy niche manufacturer
+
+- Cold-chain loggers, wearable health trackers. Must demonstrate a secure software supply chain to auditors (ISO/FDA-adjacent).
+- **Buys because:** the blockchain release log is an audit trail that cannot be edited after the fact — exportable proof of who signed every release, forever.
+
+### 4.4 Persona: DePIN network operator (blue-ocean segment)
+
+- Helium-style hotspots, Hivemapper-style dashcams: decentralized hardware networks currently updated from centralized servers — an acknowledged hypocrisy and risk in that ecosystem.
+- **Buys because:** TomPatch is the first OTA pipeline that is *native* to their decentralized trust model.
+
+### 4.5 Stakeholder: Academic evaluator (for the MVP)
+
+- Assesses the project on EnTC criteria: embedded systems relevance (serial protocols, bootloaders, hardware abstraction), security engineering rigor, and a working end-to-end demonstration. Served by §9.
+
+---
+
+## 5. Product Architecture
+
+TomPatch consists of three components, mapped one-to-one onto the monorepo:
+
+| Component | Repo folder | Stack | Role |
+|---|---|---|---|
+| Control Center (dashboard) | `TomPatch-Web/` | Next.js (App Router), Prisma, Supabase (PostgreSQL + Auth), Tailwind, RainbowKit + wagmi | Fleet management UI, release management, upload to IPFS, off-chain metadata |
+| The Judge (trust anchor) | `TomPatch-Chain/` | Solidity 0.8.x, Hardhat, Polygon (Amoy testnet for MVP) | Immutable firmware registry, release state machine, access control |
+| The Worker (edge agent/SDK) | `TomPatch-CLI/` | Python 3, web3.py, requests, pyserial; CLI + importable library | Polls chain, downloads/verifies from IPFS, installs locally or flashes downstream MCUs; also hosts the admin `verify` command |
+
+### 5.1 End-to-end pipeline
+
+```mermaid
+flowchart TD
+    subgraph phase1 [Phase 1 - Secure Build]
+        Dev[Developer pushes code to GitHub]
+        GHA[GitHub Actions: deterministic build]
+        IPFS[(IPFS via Pinata)]
+        Dev --> GHA
+        GHA -->|upload binary| IPFS
+        GHA -->|"propose(version, CID, sha256)"| SC
+    end
+
+    subgraph phase2 [Phase 2 - Dual-Verify Governance]
+        SC[Smart Contract - status PENDING]
+        Admin[Admin runs tompatch verify]
+        LocalBuild[Local deterministic build produces local hash]
+        Compare{Cloud hash == local hash?}
+        Admin --> LocalBuild
+        SC -->|read proposed hash| Compare
+        LocalBuild --> Compare
+        Compare -->|mismatch| Alert[ALERT: possible supply-chain attack - release stays PENDING]
+        Compare -->|match| Sign[Admin signs approval transaction]
+        Sign -->|status becomes LIVE| SC
+    end
+
+    subgraph phase3 [Phase 3 - Device Deployment]
+        Agent[Edge gateway agent polls contract]
+        Download[Stream download from IPFS with on-the-fly SHA-256]
+        VerifyHash{Computed hash == on-chain hash?}
+        Install[Install hook / flash downstream MCU over UART or SPI]
+        Report[Report status to dashboard]
+        SC -->|LIVE version detected| Agent
+        Agent --> Download
+        Download --> VerifyHash
+        VerifyHash -->|mismatch| Reject[Reject and alert]
+        VerifyHash -->|match| Install
+        Install --> Report
+    end
+```
+
+### 5.2 Why Dual-Verify defeats blind signing
+
+The administrator never has to "read the binary." Legitimacy is established mathematically:
+
+1. Builds are **deterministic** (pinned toolchain in Docker, stripped timestamps/paths), so identical source always yields an identical binary hash.
+2. GitHub Actions builds from the pushed commit → `hash_cloud`, proposed on-chain as `PENDING`.
+3. The admin's machine independently builds the *same signed commit* → `hash_local`.
+4. The CLI compares `hash_local` against the on-chain `hash_cloud`.
+   - **Match** → both independent environments agree; the admin signs, status → `LIVE`.
+   - **Mismatch** → one environment injected code. The CLI raises a supply-chain-attack alert and the release can never be approved.
+
+An attacker must now simultaneously compromise GitHub's build infrastructure *and* the admin's local machine *and* produce the same malicious hash in both — a categorically harder attack than SolarWinds required.
+
+### 5.3 Gateway architecture for constrained devices
+
+Class-0 devices (sensors, ECUs, pacemaker-class hardware) cannot compute SHA-256 over large files or speak to an RPC node. TomPatch therefore standardizes on an **edge gateway** (industrial PC, Raspberry Pi, diagnostic laptop):
+
+- The gateway runs the Python agent: polls the contract, downloads from IPFS, verifies the hash.
+- Only after verification does it transfer the firmware to the downstream node over a short-range serial bus (UART / SPI / USB-CDC), driving the target's bootloader (e.g., `avrdude` for Atmega328p, `esptool` for ESP32).
+- The gateway acts as a Hardware Abstraction Layer: the cloud/chain protocol is identical regardless of what hardware sits downstream.
+
+### 5.4 Data flow and storage split
+
+| Data | Where it lives | Why |
+|---|---|---|
+| Firmware binary | IPFS (pinned via Pinata) | Content-addressed: the CID *is* the hash of the content; tampering changes the address. Survives vendor shutdown. |
+| Version, CID, SHA-256, status, proposer, approver | Polygon smart contract | Immutable, publicly auditable, cheap on Polygon. |
+| Users, orgs, projects, device registry, telemetry logs, changelogs | Supabase (PostgreSQL via Prisma) | Mutable operational metadata; keeping it off-chain saves gas and keeps PII off a public ledger. |
+
+---
+
+## 6. Functional Requirements
+
+Requirements are numbered per module. "Must" = MVP requirement; "Should" = post-MVP.
+
+### Module A — Dashboard (`TomPatch-Web`)
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-A1 | Users can authenticate via Supabase Auth (email/OAuth) and connect a Web3 wallet (RainbowKit/wagmi); an org membership record links user ↔ wallet address. | Must |
+| FR-A2 | Users can create organizations and projects (e.g., "SmartLock v1"); each project maps to one registry entry/contract scope and issues an API key for CI and device agents. | Must |
+| FR-A3 | Users can upload a firmware binary (`.bin`, `.hex`); the server (Next.js Server Actions) uploads it to IPFS via Pinata, computes SHA-256, and records the release as `DRAFT` in the database. | Must |
+| FR-A4 | Releases display a lifecycle state synced from the chain: `DRAFT → PENDING → LIVE` (plus `REVOKED` via FR-B6, and an off-chain `FLAGGED` marker for failed verification per FR-D4), with the proposing source (manual upload vs. GitHub Actions) clearly labeled. | Must |
+| FR-A5 | The dashboard shows per-project fleet status: registered devices, currently installed version, last check-in, and update success/failure events (reported by agents via FR-C7). | Must |
+| FR-A6 | The dashboard renders the immutable audit trail for each release (proposal tx, approval tx, wallet addresses, timestamps) with links to PolygonScan. | Must |
+| FR-A7 | Org admins can invite/remove team members and assign roles (Admin, Developer, Viewer), stored in Postgres. | Should |
+| FR-A8 | The dashboard exposes an "Approve" action that constructs the approval transaction for wallet signing. When attestations are implemented (FR-D3), the button is disabled until a Dual-Verify attestation exists; until then, the UI displays a prominent warning if the release has not been locally verified. | Must |
+
+### Module B — Smart Contract (`TomPatch-Chain`)
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-B1 | The contract maintains an immutable registry mapping `version → { ipfsCid, sha256, status, proposer, approver, timestamps }` per project. | Must |
+| FR-B2 | `proposeUpdate(version, cid, sha256)` records a release with status `PENDING`. Callable only by authorized proposer addresses (the CI bot wallet or an org admin). | Must |
+| FR-B3 | `approveUpdate(version)` flips status `PENDING → LIVE`. Callable only by authorized approver addresses, and only for an existing `PENDING` release. | Must |
+| FR-B4 | **Monotonic versioning:** the contract rejects any proposal whose version is not strictly greater than the current `LIVE` version (`require(newVersion > latestLiveVersion)`), preventing rollback/replay attacks. | Must |
+| FR-B5 | Role-based access control: separate proposer and approver role lists per project, manageable by the project owner; a compromised proposer key alone cannot make anything `LIVE`. | Must |
+| FR-B6 | `emergencyRevoke(version)` (kill switch): an approver can mark a `LIVE` release `REVOKED`; agents treat `REVOKED` as not installable and the latest prior `LIVE` version remains authoritative. | Must |
+| FR-B7 | `getLatestLive()` view function returns the newest `LIVE` release's `(version, cid, sha256)` in a single cheap read for agents. | Must |
+| FR-B8 | All state transitions emit events (`UpdateProposed`, `UpdateApproved`, `UpdateRevoked`) for dashboard indexing and watchdog tooling. | Must |
+| FR-B9 | Contract is deployed to Polygon Amoy testnet and verified on PolygonScan (source published). | Must |
+
+### Module C — Edge Agent / Device SDK (`TomPatch-CLI`)
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-C1 | The agent polls `getLatestLive()` on a configurable interval (default 10 min) via a Polygon RPC endpoint. | Must |
+| FR-C2 | On detecting a `LIVE` version newer than the installed one, the agent downloads the binary from an IPFS gateway. | Must |
+| FR-C3 | **Stream hashing:** SHA-256 is computed on-the-fly per chunk during download (no second read pass), so verification adds near-zero latency even for GB-scale files. | Must |
+| FR-C4 | The agent installs **only** if the computed hash exactly matches the on-chain hash; on mismatch it deletes the file, logs `INTEGRITY_FAILURE`, and alerts. | Must |
+| FR-C5 | Installation is delegated to a pluggable `on_install()` hook. Reference implementations: (a) Linux process swap (stop service → replace binary → restart), (b) serial flash of a downstream MCU via `avrdude`/`esptool` over UART/SPI. | Must |
+| FR-C6 | The agent persists the installed version and never installs a version ≤ the installed one (device-side rollback defense, mirroring FR-B4). | Must |
+| FR-C7 | The agent reports outcome events (`UPDATED`, `INTEGRITY_FAILURE`, `INSTALL_FAILURE`) to the dashboard API using its project API key. | Must |
+| FR-C8 | The SDK is importable as a library with a minimal integration surface: `configure(api_key, project_id, rpc_url)` + `auto_update()`. | Should |
+| FR-C9 | `tompatch push <file> --version <v>` CLI command for manual releases: uploads to IPFS, computes hash, and submits `proposeUpdate` (developer convenience path, same governance applies). | Should |
+
+### Module D — CI/CD Integration and Dual-Verify
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-D1 | A reusable GitHub Actions workflow builds the firmware in a pinned, deterministic Docker environment (fixed toolchain versions, `SOURCE_DATE_EPOCH`, stripped debug paths), uploads the artifact to IPFS, and calls `proposeUpdate` with a dedicated CI wallet. | Must |
+| FR-D2 | `tompatch verify --version <v>`: pulls the exact proposed commit (signature-checked), rebuilds locally in the same Docker image, and compares the local hash with the on-chain proposed hash. Prints `MATCH` or a `SUPPLY-CHAIN ALERT` mismatch report. | Must |
+| FR-D3 | A successful local verification produces a signed attestation (recorded via the dashboard API) which gates the Approve button (FR-A8). The contract-level gate remains the approver's wallet signature. | Should |
+| FR-D4 | On hash mismatch, the release remains `PENDING` indefinitely; the dashboard flags it and notifies org admins. | Must |
+
+---
+
+## 7. Non-Functional Requirements
+
+| ID | Requirement | Target / Verification |
+|---|---|---|
+| NFR-1 | **Integrity:** any single-bit modification of a binary must be detected and rejected. | Demonstrated by the tamper test in §9.4 (flip one byte → agent rejects). Guaranteed by SHA-256 avalanche effect. |
+| NFR-2 | **Availability:** firmware remains downloadable even if the TomPatch dashboard and the vendor are offline. | Binary retrievable from at least two independent IPFS gateways by CID alone. |
+| NFR-3 | **Cost:** total gas per release (propose + approve) < $0.05 on Polygon PoS. | Measured on Amoy/mainnet gas estimates. |
+| NFR-4 | **Latency:** chain query for the latest release completes in < 2 s on a standard 4G connection; stream-hash verification adds < 1 s over raw download time regardless of file size. | Measured in the agent's logs. |
+| NFR-5 | **Determinism:** two builds of the same commit in the reference Docker image produce byte-identical binaries. | CI job builds twice and diffs hashes. |
+| NFR-6 | **Auditability:** every release state transition is reconstructable from public chain data alone (no reliance on TomPatch's database). | Manual reconstruction exercise from PolygonScan events. |
+| NFR-7 | **Secrets handling:** private keys are never stored in the dashboard database or transmitted to the server; signing happens client-side (wallet) or on the admin's machine (CLI). CI uses a scoped proposer-only wallet. | Code review + key-compromise analysis (§8). |
+| NFR-8 | **Compliance alignment:** the architecture maps to NIST SP 800-193 — the blockchain registry as the immutable Root of Trust, hash verification as the Detection mechanism, and revoke + reinstall of last-good version as Recovery. | Traceability table in project report. |
+| NFR-9 | **Constrained-device support:** downstream MCU nodes require no TLS stack, no RPC client, and no SHA-256 over the full image; all heavy operations run on the gateway. | Demonstrated on Atmega328p/ESP32 target in §9. |
+
+---
+
+## 8. Threat Model
+
+### 8.1 Attacks and mitigations
+
+| # | Attack | Scenario | TomPatch mitigation |
+|---|---|---|---|
+| T1 | Man-in-the-middle file swap | Attacker on the network path serves `malware.bin` instead of the real update. | Device-side hash check (FR-C4): computed hash ≠ on-chain hash → reject. The trust anchor is the chain, not the transport. |
+| T2 | Compromised update/storage server | Attacker overwrites the hosted binary. | IPFS is content-addressed — changing content changes the CID; the on-chain CID/hash no longer matches anything the attacker serves (NFR-2, FR-B1). |
+| T3 | Compromised build server (SolarWinds class) | CI is hacked; malware is built and proposed with a "legitimate" pipeline. | Dual-Verify (FR-D1/D2/D4): local reproducible build produces a different hash; release is trapped in `PENDING` and alarmed. |
+| T4 | Stolen proposer key (CI wallet) | Attacker proposes a malicious release directly. | Proposer role cannot approve (FR-B5); release sits `PENDING`, fails Dual-Verify, and admins see an unexpected proposal (FR-B8 events). Key is removed from the role list. |
+| T5 | Blind-signing manipulation | Admin is socially engineered to approve a pending malicious build. | Approval UX is gated on a verification attestation (FR-A8/FR-D3); `tompatch verify` gives the admin a mathematical yes/no instead of a judgment call. |
+| T6 | Rollback / replay attack | Attacker replays old, validly-hashed vulnerable firmware. | Contract-enforced monotonic versioning (FR-B4) + device-side version persistence (FR-C6). |
+| T7 | Malicious release discovered after going LIVE | Bad version already approved. | `emergencyRevoke` kill switch (FR-B6); agents skip `REVOKED` versions. |
+| T8 | Vendor disappearance | Company shuts down; servers go dark. | Contract and IPFS content outlive the vendor; agents keep verifying and installing without any TomPatch infrastructure (NFR-6, NFR-2). |
+| T9 | Lying RPC node | The RPC endpoint the gateway queries returns a false "latest release." | Partial mitigation today: agent can query multiple independent RPC providers and require agreement. Full fix (light clients) is roadmap — see §8.3. |
+
+### 8.2 Attack cost comparison
+
+To push malicious firmware to a TomPatch fleet, an attacker must simultaneously: compromise the CI build environment **and** the admin's local build environment (producing identical malicious hashes in both), **or** steal an approver key **and** defeat the verification-attestation gate — and in all cases the evidence is permanently on a public chain. The equivalent attack on a centralized platform requires compromising exactly one server or one key, and the logs can be scrubbed.
+
+### 8.3 Known limitations (stated honestly)
+
+1. **RPC dependency ("the chicken's neck").** Gateways cannot run full nodes; they trust RPC endpoints. Mitigation today is N-of-M RPC quorum; the real fix is light-client header verification, which is heavy for embedded targets (roadmap, §11).
+2. **Lost keys.** If all approver keys are lost, the fleet can never be updated again — immutability cuts both ways. Roadmap items: social recovery / dead-man's-switch key rotation.
+3. **Privacy.** Release cadence and metadata are public on-chain. Acceptable for the target segments (auditability is the selling point); a privacy-preserving mode is out of scope.
+4. **Latency of finality.** Block confirmation adds seconds-to-minutes versus an instant centralized push. Acceptable for firmware (not a real-time channel); emergency response is handled by revocation, not speed.
+5. **Deterministic builds are toolchain work.** Some toolchains embed timestamps/paths by default; each supported target needs a pinned, reproducible build recipe. The MVP proves it for one target.
+
+---
+
+## 9. MVP / Academic Demo Scope
+
+The MVP is the deliverable for the EnTC project evaluation. It implements every "Must" requirement in §6 on testnet infrastructure, with real hardware in the loop.
+
+### 9.1 Milestones
+
+| Milestone | Deliverable | Contents |
+|---|---|---|
+| M1 — Trust Anchor | Verified contract on Polygon Amoy | `TomPatchRegistry.sol` (FR-B1…B9), Hardhat test suite proving access control, monotonic versioning, and state transitions; PolygonScan verification. |
+| M2 — Control Room | Deployed dashboard | Auth (Supabase + wallet), project creation, upload → Pinata → SHA-256 → `DRAFT`, release lifecycle view, approve flow via wagmi (FR-A1…A6, A8). |
+| M3 — Agent | Python agent on a Raspberry Pi (or Linux laptop) | Poll → stream-download → stream-hash → verify → install hook; version persistence; status reporting (FR-C1…C7). |
+| M4 — The Loop | End-to-end live demo | Push code → GitHub Actions proposes → `tompatch verify` locally → approve in dashboard → agent detects, verifies, and flashes the target MCU → dashboard shows success. |
+| M5 — Polish | SaaS-grade presentation | Fleet status view, team invitations, README/quickstart docs, demo script. |
+
+### 9.2 Hardware bill of materials
+
+| Item | Role | Notes |
+|---|---|---|
+| Laptop (8 GB+ RAM) | Development + admin verification machine | Runs Next.js, Hardhat, Docker (deterministic builds), `tompatch verify`. |
+| Raspberry Pi 3/4/Zero | Edge gateway | Runs the Python agent. (Fallback: agent in a separate terminal on the laptop — physical Pi strongly preferred for evaluation.) |
+| ESP32 or Arduino (Atmega328p) | Downstream target node / ECU | Receives verified firmware over UART/USB-serial via `esptool`/`avrdude`; runs a visibly distinguishable behavior per firmware version (e.g., LED pattern / control-loop change). |
+| USB-serial cabling | Gateway ↔ target bus | Demonstrates the UART/SPI hardware abstraction layer. |
+
+### 9.3 Cloud/testnet bill of materials (all free tier)
+
+Polygon Amoy testnet (faucet MATIC), Pinata free tier (1 GB / 500 files), Supabase free tier, Vercel hobby deployment, GitHub Actions free minutes.
+
+### 9.4 Demo deliverables (acceptance criteria)
+
+1. **Working pipeline:** a code push results in a physically re-flashed microcontroller with observably new behavior, end-to-end through GitHub Actions → IPFS → Polygon → dashboard approval → gateway → serial flash, with no manual file transfer at any step.
+2. **Attack blocked (integrity):** serve a tampered binary (one flipped byte) to the agent; the agent logs `INTEGRITY_FAILURE`, refuses to install, and the dashboard shows the alert.
+3. **Attack blocked (supply chain):** simulate a compromised CI build (inject a change in the CI artifact only); `tompatch verify` reports a hash mismatch and the release cannot be approved.
+4. **Immutable audit trail:** reconstruct the full release history (proposer, approver, hashes, timestamps) purely from PolygonScan, demonstrating independence from TomPatch's own database.
+5. **Rollback blocked:** attempt to propose/serve an older version; the contract reverts (FR-B4) and the agent refuses (FR-C6).
+
+---
+
+## 10. Success Metrics
+
+### 10.1 MVP acceptance (academic)
+
+- All five demo deliverables in §9.4 pass live.
+- Hardhat test suite green, including negative tests (unauthorized propose/approve, downgrade attempts).
+- Gas cost per release measured < $0.05 equivalent (NFR-3); verification latency measured < 2 s (NFR-4).
+
+### 10.2 Product KPIs (post-MVP)
+
+| KPI | Definition | Target |
+|---|---|---|
+| Time-to-first-update | Signup → first successful verified device update | < 30 minutes |
+| Update success rate | `UPDATED` / (all update attempts) across fleet | > 99% |
+| Integrity catch rate | Tampered payloads rejected / tampered payloads served | 100% (hard requirement) |
+| Cost per 10k-device release (1 GB image) | Gas + storage + bandwidth | ~ $0 vs ~ $900 on AWS S3 egress |
+| Audit reconstruction time | Time for a third party to verify a release history from chain data | < 10 minutes |
+
+---
+
+## 11. Future Work
+
+- **Packaged integrations:** published `tompatch` CLI (npm/PyPI), a marketplace GitHub Action, and "flash-and-forget" SDKs for ESP32/STM32/Raspberry Pi so `check_for_updates()` is one call.
+- **Merkle-tree chunked verification:** per-chunk hashes for GB-scale images, enabling resume-and-repair (re-download only the corrupted chunk) — the BitTorrent/Git model.
+- **Light-client gateway verification:** header-chain verification on the gateway to eliminate the RPC trust dependency (T9).
+- **Key resilience:** social recovery, dead-man's-switch key rotation, and hardware-wallet approval flows to address the lost-keys risk.
+- **Optional M-of-N multi-sig approval layer:** for enterprise/critical-infrastructure tiers, layer M-of-N approver signatures plus a timelock with security-council cancellation *on top of* Dual-Verify.
+- **Watchdog service:** an independent monitor that alerts on unexpected `PENDING` proposals and anomalous release cadence.
+- **Fleet cohorting / staged rollouts:** percentage-based rollout groups and automatic halt on elevated failure rates.
+
+---
+
+## 12. Appendix
+
+### 12.1 Competitive landscape
+
+| Vendor | What it is | Architecture | How TomPatch differs |
+|---|---|---|---|
+| Mender.io | Open-source OTA updater | Centralized server; strong on the install client | TomPatch is decentralized transport + governance; Mender solves the "last mile" install, not vendor-neutral trust. |
+| Foundries.io | Secure OTA for Linux IoT | Centralized cloud | Same SPOF as any vendor cloud; no public audit trail. |
+| AWS IoT Core / Azure IoT Hub | Hyperscaler IoT platforms | Centralized, vendor-locked | Expensive egress; if the account/vendor dies, the fleet dies. TomPatch survives its own vendor. |
+| IoTeX | Blockchain-for-IoT project | Decentralized, data-focused | Targets sensor data/identity, not firmware supply-chain security. |
+| In-house PKI + S3 (status quo) | DIY signing + hosting | Centralized | Exactly the SolarWinds-shaped architecture TomPatch replaces. |
+
+### 12.2 Referenced research
+
+1. **"Patchman: A Secure Decentralized Firmware Update Delivery Service" (2024)** — blockchain metadata + IPFS binaries; validates the core architecture. Gap TomPatch fills: usable SaaS dashboard and enterprise governance (Dual-Verify).
+2. **"A Blockchain-Based OCF Firmware Update for IoT Devices" (IEEE Access, 2020)** — standards-body-aligned design; Raspberry Pi gateway verification; articulates the SPOF argument.
+3. **"Blockchain-Based Secure Firmware Updates for Electric Vehicle Charging Stations" (2023)** — establishes applicability to critical infrastructure targets.
+4. **NIST SP 800-193, Platform Firmware Resiliency Guidelines** — compliance frame: Protection (authenticity/integrity of updates) and Root of Trust (immutable ledger).
+5. **SolarWinds SUNBURST (2020) and ASUS ShadowHammer (2019) post-mortems** — the motivating attack class; SolarWinds' own remediation (triple parallel builds with hash comparison) is the industrial ancestor of Dual-Verify.
+
+### 12.3 Evolution log — superseded design decisions
+
+Recorded so future contributors understand *why* the current design looks the way it does.
+
+| Earlier idea | Why it was superseded |
+|---|---|
+| M-of-N multi-sig voting as the primary release gate ("nuclear launch codes") | Vulnerable to blind signing: N humans approving a binary none of them can inspect adds friction, not security, if the build itself is compromised. Replaced by Dual-Verify (machine-checked reproducible builds) + a single accountable human sign-off. Multi-sig survives as an optional enterprise layer (§11). |
+| 24-hour timelock + security-council emergency cancel | Deferred with multi-sig; the `PENDING → LIVE` human gate plus `emergencyRevoke` covers the MVP threat model with far less complexity. |
+| Device-side full verification for all device classes | Class-0 devices physically cannot (CPU/RAM/battery); replaced by the gateway/HAL architecture (§5.3). |
+| Ethereum mainnet | Gas costs ($5–$50/update) violate NFR-3; Polygon PoS chosen (< $0.01). |
+| Merkle-tree chunk hashing in MVP | Single stream-hash is sufficient for the demo and far simpler; Merkle trees moved to roadmap (§11). |
+| Trusting the developer's laptop as the build source ("Dropbox on the blockchain") | The uploaded binary could be pre-infected; replaced by CI-built artifacts + Dual-Verify. |
+| Separate Express/Node backend | Unnecessary; Next.js Server Actions handle uploads, secrets, and DB access with less surface area. |

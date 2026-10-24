@@ -1,14 +1,49 @@
 langchain
 langchain-core
 langchain-community
+
+# LLM Providers
+langchain-openai
 langchain-google-genai
 langchain-groq
+langchain-mistralai
+openai
+mistralai
+
+# Vector Databases
+chromadb
+faiss-cpu
+
+# Embedding Models
+sentence-transformers
+
+# Document Loaders
+pypdf
+unstructured
+beautifulsoup4
+lxml
+
+# Text Processing
+tiktoken
+
+# Environment Variables and Validation
 python-dotenv
 pydantic
+
+# Data Handling
+pandas
+numpy
+
+# API / App Layer
+fastapi
+uvicorn
+
+# UI
 streamlit
-pypdf
-beautifulsoup4
-faiss-cpu
-chromadb
+
+# Web Search and Requests
 tavily-python
 requests
+
+# Utilities
+tqdm

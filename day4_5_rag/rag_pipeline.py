@@ -9,9 +9,9 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv(override=True)
+from pathlib import Path
 
-pdf_path = "sample_pdf.pdf"
-
+pdf_path = Path(__file__).parent / "sample_pdf.pdf"
 loader = PyPDFLoader(pdf_path)
 docs = loader.load()
 
